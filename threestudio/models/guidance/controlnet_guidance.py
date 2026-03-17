@@ -23,7 +23,7 @@ class ControlNetGuidance(BaseObject):
     class Config(BaseObject.Config):
         cache_dir: Optional[str] = None
         pretrained_model_name_or_path: str = "SG161222/Realistic_Vision_V2.0"
-        ddim_scheduler_name_or_path: str = "runwayml/stable-diffusion-v1-5"
+        ddim_scheduler_name_or_path: str = "/workspace/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
         control_type: str = "normal"  # normal/canny
 
         enable_memory_efficient_attention: bool = False
@@ -91,15 +91,17 @@ class ControlNetGuidance(BaseObject):
             controlnet_name_or_path,
             torch_dtype=self.weights_dtype,
             cache_dir=self.cfg.cache_dir,
+            local_files_only=True,
         )
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
-            self.cfg.pretrained_model_name_or_path, controlnet=controlnet, **pipe_kwargs
+            self.cfg.pretrained_model_name_or_path, controlnet=controlnet, **pipe_kwargs, local_files_only=True
         ).to(self.device)
         self.scheduler = DDIMScheduler.from_pretrained(
             self.cfg.ddim_scheduler_name_or_path,
             subfolder="scheduler",
             torch_dtype=self.weights_dtype,
             cache_dir=self.cfg.cache_dir,
+            local_files_only=True,
         )
         self.scheduler.set_timesteps(self.cfg.diffusion_steps)
 

@@ -26,6 +26,8 @@ class GaussianEditor_Edit(GaussianEditor):
         clip_prompt_origin: str = ""
         clip_prompt_target: str = ""  # only for metrics
 
+        use_masked_loss: bool = True  # only compute L1/perceptual loss inside the 2D projected mask
+
     cfg: Config
 
     def configure(self) -> None:
@@ -96,11 +98,25 @@ class GaussianEditor_Edit(GaussianEditor):
                 gt_images.append(self.edit_frames[cur_index])
             gt_images = torch.concatenate(gt_images, dim=0)
 
+            if self.cfg.use_masked_loss and "masks" in out:
+                # out["masks"]: [B, H, W] bool — 3D mask projected to 2D
+                mask_2d = out["masks"].float().unsqueeze(-1)  # [B, H, W, 1]
+                # fallback to full-image loss if mask is empty (e.g. seg not set)
+                if mask_2d.sum() > 0:
+                    images_for_loss = images * mask_2d
+                    gt_for_loss = gt_images * mask_2d
+                else:
+                    images_for_loss = images
+                    gt_for_loss = gt_images
+            else:
+                images_for_loss = images
+                gt_for_loss = gt_images
+
             guidance_out = {
-                "loss_l1": torch.nn.functional.l1_loss(images, gt_images),
+                "loss_l1": torch.nn.functional.l1_loss(images_for_loss, gt_for_loss),
                 "loss_p": self.perceptual_loss(
-                    images.permute(0, 3, 1, 2).contiguous(),
-                    gt_images.permute(0, 3, 1, 2).contiguous(),
+                    images_for_loss.permute(0, 3, 1, 2).contiguous(),
+                    gt_for_loss.permute(0, 3, 1, 2).contiguous(),
                 ).sum(),
             }
             for name, value in guidance_out.items():

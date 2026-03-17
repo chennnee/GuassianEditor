@@ -1,3 +1,7 @@
+import os
+os.environ["HF_HOME"] = "/workspace/.cache/huggingface"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/workspace/.cache/huggingface/hub"
+
 from dataclasses import dataclass
 
 import cv2
@@ -15,12 +19,174 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 
 
+class SharedAttentionController:
+    """
+    Controls reference-attention injection for multi-view consistent editing.
+
+    Usage:
+        controller = SharedAttentionController(unet)
+        # Step 1: run reference view to capture KV
+        controller.set_mode("capture")
+        run_denoising(...)
+        # Step 2: run other views with injected KV
+        controller.set_mode("inject")
+        run_denoising(...)
+        # Step 3: restore original processors
+        controller.restore()
+
+    During "inject" mode, each self-attention layer concatenates the
+    reference K/V with the current view's K/V so that:
+        attn_output = softmax(Q_cur @ [K_cur, K_ref]^T) @ [V_cur, V_ref]
+    This lets the current view "see" the reference features while keeping
+    its own spatial structure (Q is unchanged).
+    """
+
+    def __init__(self, unet):
+        self.unet = unet
+        # Save original processors so we can restore later
+        self._original_processors = dict(unet.attn_processors)
+        # Identify self-attention layer names (those without "encoder" in name,
+        # i.e. not cross-attention)
+        self._self_attn_names = [
+            name for name in unet.attn_processors.keys()
+            if "attn1" in name  # attn1 = self-attention, attn2 = cross-attention
+        ]
+        # KV cache: {layer_name: {step_index: (K, V)}}
+        self.kv_cache = {}
+        self._step_counter = 0
+        self._mode = "off"  # "off", "capture", "inject"
+
+    def set_mode(self, mode: str):
+        """Switch between 'capture', 'inject', or 'off'."""
+        assert mode in ("off", "capture", "inject")
+        self._mode = mode
+        self._step_counter = 0
+        if mode == "capture":
+            self.kv_cache = {}
+        self._install_processors()
+
+    def step_done(self):
+        """Call after each denoising step to advance the step counter."""
+        self._step_counter += 1
+
+    def restore(self):
+        """Restore original attention processors."""
+        self._mode = "off"
+        self.unet.set_attn_processor(self._original_processors)
+
+    def _install_processors(self):
+        """Install custom processors for self-attention layers."""
+        if self._mode == "off":
+            self.unet.set_attn_processor(self._original_processors)
+            return
+
+        new_processors = {}
+        for name, proc in self._original_processors.items():
+            if name in self._self_attn_names:
+                new_processors[name] = _RefAttnProcessor(
+                    controller=self,
+                    layer_name=name,
+                    original_processor=proc,
+                )
+            else:
+                new_processors[name] = proc
+        self.unet.set_attn_processor(new_processors)
+
+
+class _RefAttnProcessor:
+    """
+    Custom attention processor that captures or injects reference KV.
+    Only used for self-attention (attn1) layers.
+    """
+
+    def __init__(self, controller: SharedAttentionController, layer_name: str,
+                 original_processor):
+        self.controller = controller
+        self.layer_name = layer_name
+        self.original_processor = original_processor
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+        *args, **kwargs,
+    ):
+        # This should only be called for self-attention (encoder_hidden_states=None)
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = hidden_states.shape
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        step = self.controller._step_counter
+        mode = self.controller._mode
+
+        if mode == "capture":
+            # Store KV for this layer at this step
+            if self.layer_name not in self.controller.kv_cache:
+                self.controller.kv_cache[self.layer_name] = {}
+            self.controller.kv_cache[self.layer_name][step] = (
+                key.detach().clone(),
+                value.detach().clone(),
+            )
+
+        elif mode == "inject":
+            # Concatenate reference KV with current KV
+            cache = self.controller.kv_cache.get(self.layer_name, {})
+            if step in cache:
+                ref_key, ref_value = cache[step]
+                # key/value shape: [batch*heads, seq_len, dim] after head_to_batch_dim
+                # But we haven't called head_to_batch_dim yet, so shape is [batch, seq, dim]
+                # Concatenate along sequence dimension
+                key = torch.cat([key, ref_key], dim=1)
+                value = torch.cat([value, ref_value], dim=1)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj + dropout
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+
 @threestudio.register("stable-diffusion-instructpix2pix-guidance")
 class InstructPix2PixGuidance(BaseObject):
     @dataclass
     class Config(BaseObject.Config):
         cache_dir: Optional[str] = None
-        ddim_scheduler_name_or_path: str = "CompVis/stable-diffusion-v1-4"
+        ddim_scheduler_name_or_path: str = "/workspace/.cache/huggingface/hub/models--CompVis--stable-diffusion-v1-4/snapshots/133a221b8aa7292a167afc5127cb63fb5005638b"
         ip2p_name_or_path: str = "timbrooks/instruct-pix2pix"
 
         enable_memory_efficient_attention: bool = False
@@ -61,11 +227,12 @@ class InstructPix2PixGuidance(BaseObject):
         }
 
         self.pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-            self.cfg.ip2p_name_or_path, **pipe_kwargs
+            self.cfg.ip2p_name_or_path, **pipe_kwargs, local_files_only=True
         ).to(self.device)
         self.scheduler = DDIMScheduler.from_pretrained(
             self.cfg.ddim_scheduler_name_or_path,
             subfolder="scheduler",
+            local_files_only=True,
             torch_dtype=self.weights_dtype,
             cache_dir=self.cfg.cache_dir,
         )
@@ -206,6 +373,61 @@ class InstructPix2PixGuidance(BaseObject):
             threestudio.debug("Editing finished.")
         return latents
 
+    def edit_latents_ref_attn(
+        self,
+        text_embeddings: Float[Tensor, "BB 77 768"],
+        latents: Float[Tensor, "B 4 DH DW"],
+        image_cond_latents: Float[Tensor, "B 4 DH DW"],
+        t: Int[Tensor, "B"],
+        attn_controller: SharedAttentionController = None,
+        attn_mode: str = "off",
+    ) -> Float[Tensor, "B 4 DH DW"]:
+        """
+        Same as edit_latents but with shared-attention control.
+        attn_mode: "capture" to record reference KV, "inject" to use them.
+        
+        NOTE: The caller is responsible for calling attn_controller.set_mode()
+        before and attn_controller.restore() after the full batch of views.
+        This method only resets the step counter per call.
+        """
+        self.scheduler.config.num_train_timesteps = t.item()
+        self.scheduler.set_timesteps(self.cfg.diffusion_steps)
+
+        # Reset step counter for this denoising run (KV cache is indexed by step)
+        if attn_controller is not None:
+            attn_controller._step_counter = 0
+
+        with torch.no_grad():
+            noise = torch.randn_like(latents)
+            latents = self.scheduler.add_noise(latents, noise, t)
+            threestudio.debug("Start editing (ref_attn mode=%s)...", attn_mode)
+
+            for i, t_step in enumerate(self.scheduler.timesteps):
+                with torch.no_grad():
+                    latent_model_input = torch.cat([latents] * 3)
+                    latent_model_input = torch.cat(
+                        [latent_model_input, image_cond_latents], dim=1
+                    )
+                    noise_pred = self.forward_unet(
+                        latent_model_input, t_step,
+                        encoder_hidden_states=text_embeddings,
+                    )
+
+                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                noise_pred = (
+                    noise_pred_uncond
+                    + self.cfg.guidance_scale * (noise_pred_text - noise_pred_image)
+                    + self.cfg.condition_scale * (noise_pred_image - noise_pred_uncond)
+                )
+                latents = self.scheduler.step(noise_pred, t_step, latents).prev_sample
+
+                if attn_controller is not None:
+                    attn_controller.step_done()
+
+            threestudio.debug("Editing finished (ref_attn).")
+
+        return latents
+
     def compute_grad_sds(
         self,
         text_embeddings: Float[Tensor, "BB 77 768"],
@@ -243,6 +465,8 @@ class InstructPix2PixGuidance(BaseObject):
         rgb: Float[Tensor, "B H W C"],
         cond_rgb: Float[Tensor, "B H W C"],
         prompt_utils: PromptProcessorOutput,
+        attn_controller: SharedAttentionController = None,
+        attn_mode: str = "off",
         **kwargs,
     ):
         batch_size, H, W, _ = rgb.shape
@@ -296,7 +520,13 @@ class InstructPix2PixGuidance(BaseObject):
                 "max_step": self.max_step,
             }
         else:
-            edit_latents = self.edit_latents(text_embeddings, latents, cond_latents, t)
+            if attn_controller is not None and attn_mode != "off":
+                edit_latents = self.edit_latents_ref_attn(
+                    text_embeddings, latents, cond_latents, t,
+                    attn_controller=attn_controller, attn_mode=attn_mode,
+                )
+            else:
+                edit_latents = self.edit_latents(text_embeddings, latents, cond_latents, t)
             edit_images = self.decode_latents(edit_latents)
             edit_images = F.interpolate(edit_images, (H, W), mode="bilinear")
 

@@ -21,7 +21,8 @@ def new_frustums(view_index, frame, cam, image, visible, server):
         aspect=W / H,
         scale=0.15,
         image=image, # 0-255 uint8 H W C
-        visible=visible,
+        visible=visible, 
+        
     )
 
     def attach_callback(
@@ -111,11 +112,22 @@ def sample_train_camera(colmap_cameras, edit_cam_num, server):
     train_frustums = []
 
     for idx, cam in enumerate(edit_cameras):
-        T_world_camera = tf.SE3.from_rotation_and_translation(
-            tf.SO3(cam.qvec), cam.T
-        ).inverse()
+        # Support both colmap cameras (with qvec) and Simple_Camera (with R matrix)
+        if hasattr(cam, 'qvec') and cam.qvec is not None:
+            T_world_camera = tf.SE3.from_rotation_and_translation(
+                tf.SO3(cam.qvec), cam.T
+            ).inverse()
+        else:
+            # Simple_Camera: R is world-to-cam, T is translation in cam space
+            position = -cam.R.T @ cam.T
+            wxyz = tf.SO3.from_matrix(cam.R.T).wxyz
+            T_world_camera = tf.SE3.from_rotation_and_translation(
+                tf.SO3(wxyz), position
+            )
+    
         wxyz = T_world_camera.rotation().wxyz
         position = T_world_camera.translation()
+
 
         # breakpoint()
         frame = server.add_frame(
@@ -147,5 +159,6 @@ def sample_train_camera(colmap_cameras, edit_cam_num, server):
 
         train_frames.append(frame)
         train_frustums.append(frustum)
+
 
     return edit_cameras, train_frames, train_frustums

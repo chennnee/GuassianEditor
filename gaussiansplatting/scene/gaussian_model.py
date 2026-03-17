@@ -846,7 +846,7 @@ class GaussianModel:
             # print(final_grad.abs().mean())
             return final_grad
 
-        fields = ["_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling"]
+        fields = ["_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation"]
 
         self.hooks = []
 
